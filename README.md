@@ -22,7 +22,8 @@ go run main.go
 PORT=9080 go run main.go
 
 # Run with HTTPS
-TLS_CERT=/path/to/cert.pem TLS_KEY=/path/to/key.pem go run main.go
+TLS_CERT=/path/to/cert.pem
+TLS_KEY=/path/to/key.pem go run main.go
 ```
 
 Visit `http://localhost:8080` to see all available endpoints.
