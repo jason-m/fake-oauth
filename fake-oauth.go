@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"log/syslog"
 	"net/http"
 	"net/url"
 	"os"
@@ -48,8 +49,24 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// Global config
-var config Config
+// Initialize syslog logger
+func initLogger() {
+	syslogWriter, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "fake-oauth")
+	if err != nil {
+		// Fallback to stdout if syslog is not available
+		log.Printf("Warning: Could not connect to syslog, using stdout: %v", err)
+		logger = log.New(os.Stdout, "[fake-oauth] ", log.LstdFlags)
+		return
+	}
+	logger = log.New(syslogWriter, "", 0) // syslog handles timestamps
+	logger.Println("Logger initialized with syslog")
+}
+
+// Global config and logger
+var (
+	config Config
+	logger *log.Logger
+)
 
 // In-memory storage for simplicity
 var (
@@ -211,9 +228,12 @@ func getBaseURL() string {
 // Root handler to display server information and endpoints
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
+		logger.Printf("Invalid method %s for / from %s", r.Method, r.RemoteAddr)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	logger.Printf("Index page accessed from %s", r.RemoteAddr)
 
 	baseURL := getBaseURL()
 	protocol := "http"
@@ -249,6 +269,7 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 // OAuth authorization endpoint
 func authHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
+		logger.Printf("Invalid method %s for /oauth/authorize from %s", r.Method, r.RemoteAddr)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -258,9 +279,14 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 
 	if redirectURI == "" || clientID == "" {
+		logger.Printf("Missing required parameters in authorization request from %s (client_id=%s, redirect_uri=%s)",
+			r.RemoteAddr, clientID, redirectURI)
 		http.Error(w, "Missing required parameters", http.StatusBadRequest)
 		return
 	}
+
+	logger.Printf("Authorization request: client_id=%s, redirect_uri=%s, remote_addr=%s",
+		clientID, redirectURI, r.RemoteAddr)
 
 	tmpl := template.Must(template.New("login").Parse(loginPageHTML))
 	data := struct {
@@ -280,6 +306,7 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 // Handle login form submission
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
+		logger.Printf("Invalid method %s for /oauth/login from %s", r.Method, r.RemoteAddr)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -292,6 +319,8 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	email := r.FormValue("email")
 
 	if redirectURI == "" || name == "" || email == "" {
+		logger.Printf("Missing required fields in login form from %s (name=%s, email=%s)",
+			r.RemoteAddr, name, email)
 		http.Error(w, "Missing required fields", http.StatusBadRequest)
 		return
 	}
@@ -309,9 +338,13 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt: time.Now().Add(10 * time.Minute),
 	}
 
+	logger.Printf("Authorization code generated: code=%s, name=%s, email=%s, redirect_uri=%s, remote_addr=%s",
+		authCode, name, email, redirectURI, r.RemoteAddr)
+
 	// Build redirect URL
 	redirectURL, err := url.Parse(redirectURI)
 	if err != nil {
+		logger.Printf("Invalid redirect URI: %s from %s", redirectURI, r.RemoteAddr)
 		http.Error(w, "Invalid redirect URI", http.StatusBadRequest)
 		return
 	}
@@ -323,12 +356,14 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	redirectURL.RawQuery = query.Encode()
 
+	logger.Printf("Redirecting user to: %s", redirectURL.String())
 	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
 }
 
 // OAuth token endpoint
 func tokenHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
+		logger.Printf("Invalid method %s for /oauth/token from %s", r.Method, r.RemoteAddr)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -340,11 +375,13 @@ func tokenHandler(w http.ResponseWriter, r *http.Request) {
 	redirectURI := r.FormValue("redirect_uri")
 
 	if grantType != "authorization_code" {
+		logger.Printf("Unsupported grant type: %s from %s", grantType, r.RemoteAddr)
 		http.Error(w, "Unsupported grant type", http.StatusBadRequest)
 		return
 	}
 
 	if code == "" {
+		logger.Printf("Missing authorization code in token request from %s", r.RemoteAddr)
 		http.Error(w, "Missing authorization code", http.StatusBadRequest)
 		return
 	}
@@ -352,6 +389,7 @@ func tokenHandler(w http.ResponseWriter, r *http.Request) {
 	// Validate auth code
 	authData, exists := authCodes[code]
 	if !exists {
+		logger.Printf("Invalid authorization code: %s from %s", code, r.RemoteAddr)
 		http.Error(w, "Invalid authorization code", http.StatusBadRequest)
 		return
 	}
@@ -359,12 +397,15 @@ func tokenHandler(w http.ResponseWriter, r *http.Request) {
 	// Check if code expired
 	if time.Now().After(authData.ExpiresAt) {
 		delete(authCodes, code)
+		logger.Printf("Expired authorization code: %s from %s", code, r.RemoteAddr)
 		http.Error(w, "Authorization code expired", http.StatusBadRequest)
 		return
 	}
 
 	// Validate redirect URI
 	if redirectURI != "" && redirectURI != authData.RedirectURI {
+		logger.Printf("Redirect URI mismatch: expected=%s, got=%s from %s",
+			authData.RedirectURI, redirectURI, r.RemoteAddr)
 		http.Error(w, "Invalid redirect URI", http.StatusBadRequest)
 		return
 	}
@@ -377,6 +418,9 @@ func tokenHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Delete used auth code
 	delete(authCodes, code)
+
+	logger.Printf("Access token issued: user=%s, email=%s, remote_addr=%s",
+		authData.UserData.Name, authData.UserData.Email, r.RemoteAddr)
 
 	response := TokenResponse{
 		AccessToken: accessToken,
@@ -391,18 +435,21 @@ func tokenHandler(w http.ResponseWriter, r *http.Request) {
 // OAuth userinfo endpoint
 func userinfoHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
+		logger.Printf("Invalid method %s for /oauth/userinfo from %s", r.Method, r.RemoteAddr)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
+		logger.Printf("Missing authorization header in userinfo request from %s", r.RemoteAddr)
 		http.Error(w, "Missing authorization header", http.StatusUnauthorized)
 		return
 	}
 
 	// Extract bearer token
 	if len(authHeader) < 7 || authHeader[:7] != "Bearer " {
+		logger.Printf("Invalid authorization header format from %s", r.RemoteAddr)
 		http.Error(w, "Invalid authorization header", http.StatusUnauthorized)
 		return
 	}
@@ -412,9 +459,13 @@ func userinfoHandler(w http.ResponseWriter, r *http.Request) {
 	// Look up user data
 	userData, exists := accessTokens[accessToken]
 	if !exists {
+		logger.Printf("Invalid access token used from %s", r.RemoteAddr)
 		http.Error(w, "Invalid access token", http.StatusUnauthorized)
 		return
 	}
+
+	logger.Printf("User info requested: user=%s, email=%s, remote_addr=%s",
+		userData.Name, userData.Email, r.RemoteAddr)
 
 	response := UserInfoResponse{
 		Name:  userData.Name,
@@ -428,6 +479,8 @@ func userinfoHandler(w http.ResponseWriter, r *http.Request) {
 
 // Well-known configuration endpoint
 func wellKnownHandler(w http.ResponseWriter, r *http.Request) {
+	logger.Printf("Well-known configuration accessed from %s", r.RemoteAddr)
+
 	baseURL := getBaseURL()
 
 	config := map[string]interface{}{
@@ -448,11 +501,17 @@ func main() {
 	// Load configuration
 	config = loadConfig()
 
+	// Initialize logger
+	initLogger()
+
 	// Validate TLS configuration
 	tlsEnabled := config.TLSCert != "" && config.TLSKey != ""
 	if (config.TLSCert != "" && config.TLSKey == "") || (config.TLSCert == "" && config.TLSKey != "") {
-		log.Fatal("Both TLS_CERT and TLS_KEY must be provided for TLS support")
+		logger.Fatal("Both TLS_CERT and TLS_KEY must be provided for TLS support")
 	}
+
+	logger.Printf("Server starting with configuration: bind_ip=%s, port=%s, hostname=%s, tls_enabled=%t",
+		config.BindIP, config.Port, config.Hostname, tlsEnabled)
 
 	// CORS middleware to allow requests from any origin
 	corsMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
@@ -480,6 +539,7 @@ func main() {
 
 	// Health check endpoint
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		logger.Printf("Health check from %s", r.RemoteAddr)
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
@@ -508,10 +568,12 @@ func main() {
 			MinVersion: tls.VersionTLS12,
 		}
 
-		fmt.Printf("\nStarting HTTPS server on %s...\n", listenAddr)
+		logger.Printf("Starting HTTPS server on %s", listenAddr)
+		fmt.Printf("Dummy OAuth Server starting on HTTPS %s...\n", listenAddr)
 		log.Fatal(server.ListenAndServeTLS(config.TLSCert, config.TLSKey))
 	} else {
-		fmt.Printf("\nStarting HTTP server on %s...\n", listenAddr)
+		logger.Printf("Starting HTTP server on %s", listenAddr)
+		fmt.Printf("Dummy OAuth Server starting on HTTP %s...\n", listenAddr)
 		log.Fatal(server.ListenAndServe())
 	}
 }
