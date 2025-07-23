@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -74,15 +75,19 @@ var (
 	accessTokens = make(map[string]UserData)
 )
 
+// Now UserData includes all possible fields
+type UserData struct {
+	Name   string `json:"name,omitempty"`
+	Email  string `json:"email,omitempty"`
+	Phone  string `json:"phone,omitempty"`
+	Scopes []string
+}
+
 type AuthCodeData struct {
 	RedirectURI string
 	UserData    UserData
 	ExpiresAt   time.Time
-}
-
-type UserData struct {
-	Name  string `json:"name"`
-	Email string `json:"email"`
+	Scopes      []string // Store scopes with the auth code for later use
 }
 
 type TokenResponse struct {
@@ -92,9 +97,10 @@ type TokenResponse struct {
 }
 
 type UserInfoResponse struct {
-	Name  string `json:"name"`
-	Email string `json:"email"`
-	Sub   string `json:"sub"` // Subject identifier
+	Name  string `json:"name,omitempty"`
+	Email string `json:"email,omitempty"`
+	Phone string `json:"phone,omitempty"`
+	Sub   string `json:"sub,omitempty"`
 }
 
 const loginPageHTML = `
@@ -106,7 +112,7 @@ const loginPageHTML = `
         body { font-family: Arial, sans-serif; max-width: 400px; margin: 100px auto; padding: 20px; }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; }
-        input[type="text"], input[type="email"] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+        input[type="text"], input[type="email"], input[type="tel"] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
         button { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; width: 100%; }
         button:hover { background-color: #0056b3; }
         .header { text-align: center; margin-bottom: 30px; }
@@ -115,23 +121,23 @@ const loginPageHTML = `
 <body>
     <div class="header">
         <h2>Dummy OAuth Login</h2>
-        <p>Enter any name and email to continue</p>
+        <p>Provide information for the requested scopes</p>
     </div>
     <form method="POST" action="/oauth/login">
         <input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
         <input type="hidden" name="client_id" value="{{.ClientID}}">
         <input type="hidden" name="state" value="{{.State}}">
-        
-        <div class="form-group">
-            <label for="name">Name:</label>
-            <input type="text" id="name" name="name" required placeholder="John Doe">
-        </div>
-        
-        <div class="form-group">
-            <label for="email">Email:</label>
-            <input type="email" id="email" name="email" required placeholder="john@example.com">
-        </div>
-        
+        <input type="hidden" name="scopes" value="{{.ScopesRaw}}">
+        {{range .ScopeFields}}
+            <div class="form-group">
+                <label for="{{.Field}}">{{.Label}}</label>
+                <input 
+                    {{if eq .Field "email"}}type="email"{{else if eq .Field "phone"}}type="tel"{{else}}type="text"{{end}}
+                    id="{{.Field}}" name="{{.Field}}" 
+                    {{if .Required}}required{{end}}
+                    placeholder="{{.Placeholder}}">
+            </div>
+        {{end}}
         <button type="submit">Authorize</button>
     </form>
 </body>
@@ -170,7 +176,7 @@ const indexPageHTML = `
         <h3>Authorization Endpoint</h3>
         <div class="url">{{.BaseURL}}/oauth/authorize</div>
         <div class="description">Start the OAuth flow by redirecting users here</div>
-        <div class="example">Example: {{.BaseURL}}/oauth/authorize?client_id=test&redirect_uri=http://localhost:3000/callback&response_type=code&state=xyz</div>
+        <div class="example">Example: {{.BaseURL}}/oauth/authorize?client_id=test&redirect_uri=http://localhost:3000/callback&response_type=code&state=xyz&scope=profile%20email</div>
     </div>
 
     <div class="endpoint">
@@ -225,6 +231,35 @@ func getBaseURL() string {
 	return fmt.Sprintf("%s://%s:%s", scheme, config.Hostname, port)
 }
 
+// Helper for scope mapping: label, fieldname, placeholder
+type scopeField struct {
+	Scope      string
+	Field      string
+	Label      string
+	Placeholder string
+	Required   bool
+}
+
+// Supported scopes and their form details
+var supportedScopes = []scopeField{
+	{"profile", "name", "Name", "John Doe", true},
+	{"email",   "email", "Email", "john@example.com", true},
+	{"phone",   "phone", "Phone", "+123456789", false},
+}
+
+// Returns list of scopeField for the input scopes
+func getScopeFields(scopes []string) []scopeField {
+	var result []scopeField
+	for _, scope := range scopes {
+		for _, sf := range supportedScopes {
+			if sf.Scope == scope {
+				result = append(result, sf)
+			}
+		}
+	}
+	return result
+}
+
 // Root handler to display server information and endpoints
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
@@ -277,6 +312,12 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 	redirectURI := r.URL.Query().Get("redirect_uri")
 	clientID := r.URL.Query().Get("client_id")
 	state := r.URL.Query().Get("state")
+	scopeRaw := r.URL.Query().Get("scope")
+	scopes := []string{}
+	if scopeRaw != "" {
+		// Split by space(s), as per OAuth standard
+		scopes = strings.Fields(scopeRaw)
+	}
 
 	if redirectURI == "" || clientID == "" {
 		logger.Printf("Missing required parameters in authorization request from %s (client_id=%s, redirect_uri=%s)",
@@ -285,18 +326,25 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logger.Printf("Authorization request: client_id=%s, redirect_uri=%s, remote_addr=%s",
-		clientID, redirectURI, r.RemoteAddr)
+	logger.Printf("Authorization request: client_id=%s, redirect_uri=%s, scopes=%v, remote_addr=%s",
+		clientID, redirectURI, scopes, r.RemoteAddr)
+
+	// Prepare scope fields for the form
+	scopeFields := getScopeFields(scopes)
 
 	tmpl := template.Must(template.New("login").Parse(loginPageHTML))
 	data := struct {
 		RedirectURI string
 		ClientID    string
 		State       string
+		ScopesRaw   string
+		ScopeFields []scopeField
 	}{
 		RedirectURI: redirectURI,
 		ClientID:    clientID,
 		State:       state,
+		ScopesRaw:   scopeRaw,
+		ScopeFields: scopeFields,
 	}
 
 	w.Header().Set("Content-Type", "text/html")
@@ -315,12 +363,34 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 	redirectURI := r.FormValue("redirect_uri")
 	state := r.FormValue("state")
-	name := r.FormValue("name")
-	email := r.FormValue("email")
+	scopesRaw := r.FormValue("scopes")
+	scopes := []string{}
+	if scopesRaw != "" {
+		scopes = strings.Fields(scopesRaw)
+	}
 
-	if redirectURI == "" || name == "" || email == "" {
-		logger.Printf("Missing required fields in login form from %s (name=%s, email=%s)",
-			r.RemoteAddr, name, email)
+	// Prepare user data only for requested scopes
+	userData := UserData{}
+	userData.Scopes = scopes
+
+	missing := false
+	for _, sf := range getScopeFields(scopes) {
+		val := r.FormValue(sf.Field)
+		if sf.Required && val == "" {
+			missing = true
+			logger.Printf("Missing required field %s in login form from %s", sf.Field, r.RemoteAddr)
+			break
+		}
+		switch sf.Field {
+		case "name":
+			userData.Name = val
+		case "email":
+			userData.Email = val
+		case "phone":
+			userData.Phone = val
+		}
+	}
+	if redirectURI == "" || missing {
 		http.Error(w, "Missing required fields", http.StatusBadRequest)
 		return
 	}
@@ -328,18 +398,16 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	// Generate authorization code
 	authCode := generateRandomString(16)
 
-	// Store auth code data
+	// Store auth code data with scopes
 	authCodes[authCode] = AuthCodeData{
 		RedirectURI: redirectURI,
-		UserData: UserData{
-			Name:  name,
-			Email: email,
-		},
-		ExpiresAt: time.Now().Add(10 * time.Minute),
+		UserData:    userData,
+		ExpiresAt:   time.Now().Add(10 * time.Minute),
+		Scopes:      scopes,
 	}
 
-	logger.Printf("Authorization code generated: code=%s, name=%s, email=%s, redirect_uri=%s, remote_addr=%s",
-		authCode, name, email, redirectURI, r.RemoteAddr)
+	logger.Printf("Authorization code generated: code=%s, user=%+v, redirect_uri=%s, remote_addr=%s",
+		authCode, userData, redirectURI, r.RemoteAddr)
 
 	// Build redirect URL
 	redirectURL, err := url.Parse(redirectURI)
@@ -419,8 +487,8 @@ func tokenHandler(w http.ResponseWriter, r *http.Request) {
 	// Delete used auth code
 	delete(authCodes, code)
 
-	logger.Printf("Access token issued: user=%s, email=%s, remote_addr=%s",
-		authData.UserData.Name, authData.UserData.Email, r.RemoteAddr)
+	logger.Printf("Access token issued: user=%+v, remote_addr=%s",
+		authData.UserData, r.RemoteAddr)
 
 	response := TokenResponse{
 		AccessToken: accessToken,
@@ -464,13 +532,26 @@ func userinfoHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logger.Printf("User info requested: user=%s, email=%s, remote_addr=%s",
-		userData.Name, userData.Email, r.RemoteAddr)
+	logger.Printf("User info requested: user=%+v, remote_addr=%s", userData, r.RemoteAddr)
 
-	response := UserInfoResponse{
-		Name:  userData.Name,
-		Email: userData.Email,
-		Sub:   userData.Email, // Using email as subject identifier
+	response := UserInfoResponse{}
+	for _, scope := range userData.Scopes {
+		switch scope {
+		case "profile":
+			response.Name = userData.Name
+		case "email":
+			response.Email = userData.Email
+			// Set Sub to email if email is present
+			if response.Email != "" {
+				response.Sub = response.Email
+			}
+		case "phone":
+			response.Phone = userData.Phone
+		}
+	}
+	// If sub not set, fallback to name
+	if response.Sub == "" && response.Name != "" {
+		response.Sub = response.Name
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -491,6 +572,7 @@ func wellKnownHandler(w http.ResponseWriter, r *http.Request) {
 		"response_types_supported":              []string{"code"},
 		"grant_types_supported":                 []string{"authorization_code"},
 		"token_endpoint_auth_methods_supported": []string{"none", "client_secret_post"},
+		"scopes_supported":                      []string{"profile", "email", "phone"},
 	}
 
 	w.Header().Set("Content-Type", "application/json")
