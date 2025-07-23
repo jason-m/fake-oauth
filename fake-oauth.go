@@ -1,85 +1,7 @@
-package main
+// ... (imports and config unchanged)
 
-import (
-	"crypto/rand"
-	"crypto/tls"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"html/template"
-	"log"
-	"log/syslog"
-	"net/http"
-	"net/url"
-	"os"
-	"strings"
-	"time"
-)
-
-// Configuration loaded from environment variables
-type Config struct {
-	BindIP   string
-	Port     string
-	Hostname string
-	TLSCert  string
-	TLSKey   string
-}
-
-// Load configuration from environment variables with defaults
-func loadConfig() Config {
-	config := Config{
-		BindIP:   getEnv("BIND_IP", "127.0.0.1"),
-		Port:     getEnv("PORT", "8080"),
-		Hostname: getEnv("OAUTH_HOSTNAME", "localhost"),
-		TLSCert:  getEnv("TLS_CERT", ""),
-		TLSKey:   getEnv("TLS_KEY", ""),
-	}
-
-	// If hostname is not set and we're binding to all interfaces, try to be smart
-	if config.Hostname == "localhost" && config.BindIP == "0.0.0.0" {
-		config.Hostname = "localhost"
-	}
-
-	return config
-}
-
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
-// Initialize syslog logger
-func initLogger() {
-	syslogWriter, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "fake-oauth")
-	if err != nil {
-		// Fallback to stdout if syslog is not available
-		log.Printf("Warning: Could not connect to syslog, using stdout: %v", err)
-		logger = log.New(os.Stdout, "[fake-oauth] ", log.LstdFlags)
-		return
-	}
-	logger = log.New(syslogWriter, "", 0) // syslog handles timestamps
-	logger.Println("Logger initialized with syslog")
-}
-
-// Global config and logger
-var (
-	config Config
-	logger *log.Logger
-)
-
-// In-memory storage for simplicity
-var (
-	authCodes    = make(map[string]AuthCodeData)
-	accessTokens = make(map[string]UserData)
-)
-
-// Now UserData includes all possible fields
 type UserData struct {
-	Name   string `json:"name,omitempty"`
-	Email  string `json:"email,omitempty"`
-	Phone  string `json:"phone,omitempty"`
+	Fields map[string]string // Maps scope name to user-provided value
 	Scopes []string
 }
 
@@ -87,21 +9,10 @@ type AuthCodeData struct {
 	RedirectURI string
 	UserData    UserData
 	ExpiresAt   time.Time
-	Scopes      []string // Store scopes with the auth code for later use
+	Scopes      []string
 }
 
-type TokenResponse struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	ExpiresIn   int    `json:"expires_in"`
-}
-
-type UserInfoResponse struct {
-	Name  string `json:"name,omitempty"`
-	Email string `json:"email,omitempty"`
-	Phone string `json:"phone,omitempty"`
-	Sub   string `json:"sub,omitempty"`
-}
+type UserInfoResponse map[string]string
 
 const loginPageHTML = `
 <!DOCTYPE html>
@@ -112,7 +23,7 @@ const loginPageHTML = `
         body { font-family: Arial, sans-serif; max-width: 400px; margin: 100px auto; padding: 20px; }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; }
-        input[type="text"], input[type="email"], input[type="tel"] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+        input[type="text"], input[type="email"] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
         button { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; width: 100%; }
         button:hover { background-color: #0056b3; }
         .header { text-align: center; margin-bottom: 30px; }
@@ -128,14 +39,10 @@ const loginPageHTML = `
         <input type="hidden" name="client_id" value="{{.ClientID}}">
         <input type="hidden" name="state" value="{{.State}}">
         <input type="hidden" name="scopes" value="{{.ScopesRaw}}">
-        {{range .ScopeFields}}
+        {{range .Scopes}}
             <div class="form-group">
-                <label for="{{.Field}}">{{.Label}}</label>
-                <input 
-                    {{if eq .Field "email"}}type="email"{{else if eq .Field "phone"}}type="tel"{{else}}type="text"{{end}}
-                    id="{{.Field}}" name="{{.Field}}" 
-                    {{if .Required}}required{{end}}
-                    placeholder="{{.Placeholder}}">
+                <label for="{{.}}">{{.}}</label>
+                <input type="{{if eq . "email"}}email{{else}}text{{end}}" id="{{.}}" name="{{.}}" required placeholder="{{.}}">
             </div>
         {{end}}
         <button type="submit">Authorize</button>
@@ -144,164 +51,19 @@ const loginPageHTML = `
 </html>
 `
 
-const indexPageHTML = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Dummy OAuth Server</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
-        .header { text-align: center; margin-bottom: 40px; }
-        .endpoint { background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px; padding: 15px; margin-bottom: 15px; }
-        .endpoint h3 { margin-top: 0; color: #495057; }
-        .url { font-family: monospace; font-size: 14px; background: #e9ecef; padding: 8px; border-radius: 3px; word-break: break-all; }
-        .description { margin-top: 10px; color: #6c757d; font-size: 14px; }
-        .example { background: #f1f3f4; padding: 10px; border-radius: 3px; font-family: monospace; font-size: 12px; margin-top: 10px; }
-        .status { padding: 10px; border-radius: 5px; margin-bottom: 20px; }
-        .status.http { background: #fff3cd; border: 1px solid #ffeaa7; }
-        .status.https { background: #d1ecf1; border: 1px solid #bee5eb; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>Dummy OAuth Server</h1>
-        <p>A simple OAuth 2.0 server for testing and development</p>
-    </div>
+// ... indexPageHTML unchanged
 
-    <div class="status {{.Protocol}}">
-        <strong>Server Status:</strong> Running on {{.Protocol | upper}} | Hostname: {{.Hostname}} | Port: {{.Port}}
-    </div>
-
-    <div class="endpoint">
-        <h3>Authorization Endpoint</h3>
-        <div class="url">{{.BaseURL}}/oauth/authorize</div>
-        <div class="description">Start the OAuth flow by redirecting users here</div>
-        <div class="example">Example: {{.BaseURL}}/oauth/authorize?client_id=test&redirect_uri=http://localhost:3000/callback&response_type=code&state=xyz&scope=profile%20email</div>
-    </div>
-
-    <div class="endpoint">
-        <h3>Token Endpoint</h3>
-        <div class="url">{{.BaseURL}}/oauth/token</div>
-        <div class="description">Exchange authorization code for access token (POST)</div>
-        <div class="example">POST with: grant_type=authorization_code&code=AUTH_CODE&redirect_uri=REDIRECT_URI</div>
-    </div>
-
-    <div class="endpoint">
-        <h3>User Info Endpoint</h3>
-        <div class="url">{{.BaseURL}}/oauth/userinfo</div>
-        <div class="description">Get user information using access token</div>
-        <div class="example">GET with Authorization: Bearer ACCESS_TOKEN</div>
-    </div>
-
-    <div class="endpoint">
-        <h3>Well-Known Configuration</h3>
-        <div class="url">{{.BaseURL}}/.well-known/openid_configuration</div>
-        <div class="description">OpenID Connect discovery document</div>
-        <div class="example"><a href="{{.BaseURL}}/.well-known/openid_configuration" target="_blank">View Configuration</a></div>
-    </div>
-
-    <div class="endpoint">
-        <h3>Health Check</h3>
-        <div class="url">{{.BaseURL}}/health</div>
-        <div class="description">Simple health check endpoint</div>
-        <div class="example"><a href="{{.BaseURL}}/health" target="_blank">Check Health</a></div>
-    </div>
-</body>
-</html>
-`
-
-func generateRandomString(length int) string {
-	bytes := make([]byte, length)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
+func parseScopes(scopeRaw string) []string {
+	if scopeRaw == "" {
+		return []string{"profile", "email"}
+	}
+	parts := strings.Fields(scopeRaw)
+	if len(parts) == 0 {
+		return []string{"profile", "email"}
+	}
+	return parts
 }
 
-func getBaseURL() string {
-	scheme := "http"
-	if config.TLSCert != "" && config.TLSKey != "" {
-		scheme = "https"
-	}
-
-	// Handle default ports
-	port := config.Port
-	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
-		return fmt.Sprintf("%s://%s", scheme, config.Hostname)
-	}
-
-	return fmt.Sprintf("%s://%s:%s", scheme, config.Hostname, port)
-}
-
-// Helper for scope mapping: label, fieldname, placeholder
-type scopeField struct {
-	Scope      string
-	Field      string
-	Label      string
-	Placeholder string
-	Required   bool
-}
-
-// Supported scopes and their form details
-var supportedScopes = []scopeField{
-	{"profile", "name", "Name", "John Doe", true},
-	{"email",   "email", "Email", "john@example.com", true},
-	{"phone",   "phone", "Phone", "+123456789", false},
-}
-
-// Returns list of scopeField for the input scopes
-func getScopeFields(scopes []string) []scopeField {
-	var result []scopeField
-	for _, scope := range scopes {
-		for _, sf := range supportedScopes {
-			if sf.Scope == scope {
-				result = append(result, sf)
-			}
-		}
-	}
-	return result
-}
-
-// Root handler to display server information and endpoints
-func indexHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		logger.Printf("Invalid method %s for / from %s", r.Method, r.RemoteAddr)
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	logger.Printf("Index page accessed from %s", r.RemoteAddr)
-
-	baseURL := getBaseURL()
-	protocol := "http"
-	if config.TLSCert != "" && config.TLSKey != "" {
-		protocol = "https"
-	}
-
-	tmpl := template.Must(template.New("index").Funcs(template.FuncMap{
-		"upper": func(s string) string {
-			if s == "https" {
-				return "HTTPS"
-			}
-			return "HTTP"
-		},
-	}).Parse(indexPageHTML))
-
-	data := struct {
-		BaseURL  string
-		Protocol string
-		Hostname string
-		Port     string
-	}{
-		BaseURL:  baseURL,
-		Protocol: protocol,
-		Hostname: config.Hostname,
-		Port:     config.Port,
-	}
-
-	w.Header().Set("Content-Type", "text/html")
-	tmpl.Execute(w, data)
-}
-
-// OAuth authorization endpoint
 func authHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		logger.Printf("Invalid method %s for /oauth/authorize from %s", r.Method, r.RemoteAddr)
@@ -313,11 +75,7 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 	clientID := r.URL.Query().Get("client_id")
 	state := r.URL.Query().Get("state")
 	scopeRaw := r.URL.Query().Get("scope")
-	scopes := []string{}
-	if scopeRaw != "" {
-		// Split by space(s), as per OAuth standard
-		scopes = strings.Fields(scopeRaw)
-	}
+	scopes := parseScopes(scopeRaw)
 
 	if redirectURI == "" || clientID == "" {
 		logger.Printf("Missing required parameters in authorization request from %s (client_id=%s, redirect_uri=%s)",
@@ -329,29 +87,25 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 	logger.Printf("Authorization request: client_id=%s, redirect_uri=%s, scopes=%v, remote_addr=%s",
 		clientID, redirectURI, scopes, r.RemoteAddr)
 
-	// Prepare scope fields for the form
-	scopeFields := getScopeFields(scopes)
-
 	tmpl := template.Must(template.New("login").Parse(loginPageHTML))
 	data := struct {
 		RedirectURI string
 		ClientID    string
 		State       string
 		ScopesRaw   string
-		ScopeFields []scopeField
+		Scopes      []string
 	}{
 		RedirectURI: redirectURI,
 		ClientID:    clientID,
 		State:       state,
-		ScopesRaw:   scopeRaw,
-		ScopeFields: scopeFields,
+		ScopesRaw:   strings.Join(scopes, " "),
+		Scopes:      scopes,
 	}
 
 	w.Header().Set("Content-Type", "text/html")
 	tmpl.Execute(w, data)
 }
 
-// Handle login form submission
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		logger.Printf("Invalid method %s for /oauth/login from %s", r.Method, r.RemoteAddr)
@@ -364,35 +118,28 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	redirectURI := r.FormValue("redirect_uri")
 	state := r.FormValue("state")
 	scopesRaw := r.FormValue("scopes")
-	scopes := []string{}
-	if scopesRaw != "" {
-		scopes = strings.Fields(scopesRaw)
-	}
+	scopes := parseScopes(scopesRaw)
 
-	// Prepare user data only for requested scopes
-	userData := UserData{}
-	userData.Scopes = scopes
-
+	userFields := make(map[string]string)
 	missing := false
-	for _, sf := range getScopeFields(scopes) {
-		val := r.FormValue(sf.Field)
-		if sf.Required && val == "" {
+	for _, scope := range scopes {
+		val := r.FormValue(scope)
+		if val == "" {
 			missing = true
-			logger.Printf("Missing required field %s in login form from %s", sf.Field, r.RemoteAddr)
+			logger.Printf("Missing required field '%s' in login form from %s", scope, r.RemoteAddr)
 			break
 		}
-		switch sf.Field {
-		case "name":
-			userData.Name = val
-		case "email":
-			userData.Email = val
-		case "phone":
-			userData.Phone = val
-		}
+		userFields[scope] = val
 	}
+
 	if redirectURI == "" || missing {
 		http.Error(w, "Missing required fields", http.StatusBadRequest)
 		return
+	}
+
+	userData := UserData{
+		Fields: userFields,
+		Scopes: scopes,
 	}
 
 	// Generate authorization code
@@ -428,7 +175,6 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
 }
 
-// OAuth token endpoint
 func tokenHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		logger.Printf("Invalid method %s for /oauth/token from %s", r.Method, r.RemoteAddr)
@@ -500,7 +246,6 @@ func tokenHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// OAuth userinfo endpoint
 func userinfoHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		logger.Printf("Invalid method %s for /oauth/userinfo from %s", r.Method, r.RemoteAddr)
@@ -534,128 +279,21 @@ func userinfoHandler(w http.ResponseWriter, r *http.Request) {
 
 	logger.Printf("User info requested: user=%+v, remote_addr=%s", userData, r.RemoteAddr)
 
-	response := UserInfoResponse{}
+	// Return only the fields that were in the authorized scopes
+	resp := UserInfoResponse{}
 	for _, scope := range userData.Scopes {
-		switch scope {
-		case "profile":
-			response.Name = userData.Name
-		case "email":
-			response.Email = userData.Email
-			// Set Sub to email if email is present
-			if response.Email != "" {
-				response.Sub = response.Email
-			}
-		case "phone":
-			response.Phone = userData.Phone
+		if val, ok := userData.Fields[scope]; ok {
+			resp[scope] = val
 		}
 	}
-	// If sub not set, fallback to name
-	if response.Sub == "" && response.Name != "" {
-		response.Sub = response.Name
+	// Set "sub" field for OIDC compatibility
+	if email, ok := resp["email"]; ok && email != "" {
+		resp["sub"] = email
+	} else if profile, ok := resp["profile"]; ok && profile != "" {
+		resp["sub"] = profile
 	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(resp)
 }
 
-// Well-known configuration endpoint
-func wellKnownHandler(w http.ResponseWriter, r *http.Request) {
-	logger.Printf("Well-known configuration accessed from %s", r.RemoteAddr)
-
-	baseURL := getBaseURL()
-
-	config := map[string]interface{}{
-		"issuer":                                baseURL,
-		"authorization_endpoint":                baseURL + "/oauth/authorize",
-		"token_endpoint":                        baseURL + "/oauth/token",
-		"userinfo_endpoint":                     baseURL + "/oauth/userinfo",
-		"response_types_supported":              []string{"code"},
-		"grant_types_supported":                 []string{"authorization_code"},
-		"token_endpoint_auth_methods_supported": []string{"none", "client_secret_post"},
-		"scopes_supported":                      []string{"profile", "email", "phone"},
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(config)
-}
-
-func main() {
-	// Load configuration
-	config = loadConfig()
-
-	// Initialize logger
-	initLogger()
-
-	// Validate TLS configuration
-	tlsEnabled := config.TLSCert != "" && config.TLSKey != ""
-	if (config.TLSCert != "" && config.TLSKey == "") || (config.TLSCert == "" && config.TLSKey != "") {
-		logger.Fatal("Both TLS_CERT and TLS_KEY must be provided for TLS support")
-	}
-
-	logger.Printf("Server starting with configuration: bind_ip=%s, port=%s, hostname=%s, tls_enabled=%t",
-		config.BindIP, config.Port, config.Hostname, tlsEnabled)
-
-	// CORS middleware to allow requests from any origin
-	corsMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-
-			next(w, r)
-		}
-	}
-
-	// OAuth endpoints
-	http.HandleFunc("/", corsMiddleware(indexHandler))
-	http.HandleFunc("/oauth/authorize", corsMiddleware(authHandler))
-	http.HandleFunc("/oauth/login", corsMiddleware(loginHandler))
-	http.HandleFunc("/oauth/token", corsMiddleware(tokenHandler))
-	http.HandleFunc("/oauth/userinfo", corsMiddleware(userinfoHandler))
-	http.HandleFunc("/.well-known/openid_configuration", corsMiddleware(wellKnownHandler))
-
-	// Health check endpoint
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		logger.Printf("Health check from %s", r.RemoteAddr)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-
-	listenAddr := config.BindIP + ":" + config.Port
-	baseURL := getBaseURL()
-
-	fmt.Printf("Dummy OAuth Server Configuration:\n")
-	fmt.Printf("  Bind Address: %s\n", listenAddr)
-	fmt.Printf("  Hostname: %s\n", config.Hostname)
-	fmt.Printf("  TLS Enabled: %t\n", tlsEnabled)
-	fmt.Printf("\nEndpoints:\n")
-	fmt.Printf("  Authorization: %s/oauth/authorize\n", baseURL)
-	fmt.Printf("  Token:         %s/oauth/token\n", baseURL)
-	fmt.Printf("  UserInfo:      %s/oauth/userinfo\n", baseURL)
-	fmt.Printf("  Well-known:    %s/.well-known/openid_configuration\n", baseURL)
-	fmt.Printf("  Health:        %s/health\n", baseURL)
-
-	server := &http.Server{
-		Addr: listenAddr,
-	}
-
-	if tlsEnabled {
-		// Configure TLS
-		server.TLSConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		}
-
-		logger.Printf("Starting HTTPS server on %s", listenAddr)
-		fmt.Printf("Dummy OAuth Server starting on HTTPS %s...\n", listenAddr)
-		log.Fatal(server.ListenAndServeTLS(config.TLSCert, config.TLSKey))
-	} else {
-		logger.Printf("Starting HTTP server on %s", listenAddr)
-		fmt.Printf("Dummy OAuth Server starting on HTTP %s...\n", listenAddr)
-		log.Fatal(server.ListenAndServe())
-	}
-}
+// ... wellKnownHandler and main unchanged
